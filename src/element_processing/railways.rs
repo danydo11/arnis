@@ -1,7 +1,11 @@
 use crate::block_definitions::*;
 use crate::bresenham::bresenham_line;
+use crate::element_processing::elevation::infer_structure_elevation;
 use crate::osm_parser::ProcessedWay;
 use crate::world_editor::WorldEditor;
+
+const DEFAULT_RAILWAY_CLEARANCE: i32 = 4;
+const SUPPORT_INTERVAL: usize = 8;
 
 pub fn generate_railways(editor: &mut WorldEditor, element: &ProcessedWay) {
     if let Some(railway_type) = element.tags.get("railway") {
@@ -30,6 +34,9 @@ pub fn generate_railways(editor: &mut WorldEditor, element: &ProcessedWay) {
             }
         }
 
+        let elevation_offset = infer_structure_elevation(&element.tags, DEFAULT_RAILWAY_CLEARANCE);
+        let add_supports = elevation_offset > 0;
+
         for i in 1..element.nodes.len() {
             let prev_node = element.nodes[i - 1].xz();
             let cur_node = element.nodes[i].xz();
@@ -40,7 +47,11 @@ pub fn generate_railways(editor: &mut WorldEditor, element: &ProcessedWay) {
             for j in 0..smoothed_points.len() {
                 let (bx, _, bz) = smoothed_points[j];
 
-                editor.set_block(GRAVEL, bx, 0, bz, None, None);
+                let ground_y = editor.get_absolute_y(bx, 0, bz);
+                let ballast_y = ground_y + elevation_offset;
+                let rail_y = ballast_y + 1;
+
+                editor.set_block_absolute(GRAVEL, bx, ballast_y, bz, None, None);
 
                 let prev = if j > 0 {
                     Some(smoothed_points[j - 1])
@@ -59,10 +70,26 @@ pub fn generate_railways(editor: &mut WorldEditor, element: &ProcessedWay) {
                     next.map(|(x, _, z)| (x, z)),
                 );
 
-                editor.set_block(rail_block, bx, 1, bz, None, None);
+                editor.set_block_absolute(rail_block, bx, rail_y, bz, None, None);
 
                 if bx % 4 == 0 {
-                    editor.set_block(OAK_LOG, bx, 0, bz, None, None);
+                    editor.set_block_absolute(OAK_LOG, bx, ballast_y, bz, None, None);
+                }
+
+                if add_supports {
+                    if elevation_offset > 1 {
+                        editor.set_block_absolute(STONE_BRICKS, bx, ballast_y - 1, bz, None, None);
+                    }
+
+                    if ((bx + bz).rem_euclid(SUPPORT_INTERVAL as i32) == 0)
+                        && ballast_y - ground_y > 1
+                    {
+                        let mut support_y = ground_y + 1;
+                        while support_y < ballast_y {
+                            editor.set_block_absolute(STONE_BRICKS, bx, support_y, bz, None, None);
+                            support_y += 1;
+                        }
+                    }
                 }
             }
         }
@@ -240,5 +267,121 @@ pub fn generate_roller_coaster(editor: &mut WorldEditor, element: &ProcessedWay)
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate_railways, smooth_diagonal_rails};
+    use crate::block_definitions::{
+        GRAVEL, RAIL_EAST_WEST, RAIL_NORTH_EAST, RAIL_NORTH_SOUTH, RAIL_NORTH_WEST,
+        RAIL_SOUTH_EAST, RAIL_SOUTH_WEST, STONE_BRICKS,
+    };
+    use crate::coordinate_system::{cartesian::XZBBox, geographic::LLBBox};
+    use crate::ground::Ground;
+    use crate::osm_parser::{ProcessedNode, ProcessedWay};
+    use crate::world_editor::WorldEditor;
+    use std::collections::HashMap;
+
+    fn build_editor<'a>() -> (tempfile::TempDir, XZBBox, LLBBox, Ground, WorldEditor<'a>) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmpdir.path().join("region")).unwrap();
+
+        let xzbbox = XZBBox::rect_from_xz_lengths(32.0, 32.0).unwrap();
+        let llbbox = LLBBox::new(0.0, 0.0, 1.0, 1.0).unwrap();
+        let ground = Ground::new_flat(0);
+
+        let mut editor = WorldEditor::new(tmpdir.path().to_path_buf(), &xzbbox, llbbox);
+        editor.set_ground(&ground);
+
+        (tmpdir, xzbbox, llbbox, ground, editor)
+    }
+
+    fn sample_railway() -> ProcessedWay {
+        let nodes = (0..=5)
+            .map(|idx| ProcessedNode {
+                id: idx,
+                tags: HashMap::new(),
+                x: 6 + idx,
+                z: 10,
+            })
+            .collect();
+
+        let mut tags = HashMap::new();
+        tags.insert("railway".to_string(), "rail".to_string());
+        tags.insert("layer".to_string(), "1".to_string());
+
+        ProcessedWay {
+            id: 99,
+            nodes,
+            tags,
+        }
+    }
+
+    #[test]
+    fn elevated_layer_places_raised_track() {
+        let (_tmpdir, _xzbbox, _llbbox, ground, mut editor) = build_editor();
+        let way = sample_railway();
+
+        editor.set_ground(&ground);
+        generate_railways(&mut editor, &way);
+
+        let rail_blocks = [
+            RAIL_NORTH_SOUTH,
+            RAIL_EAST_WEST,
+            RAIL_NORTH_EAST,
+            RAIL_NORTH_WEST,
+            RAIL_SOUTH_EAST,
+            RAIL_SOUTH_WEST,
+        ];
+
+        let midpoint = &way.nodes[3];
+        let ground_y = editor.get_absolute_y(midpoint.x, 0, midpoint.z);
+        let mut found_rail = None;
+
+        for y in ground_y + 1..ground_y + 20 {
+            if editor.check_for_block_absolute(midpoint.x, y, midpoint.z, Some(&rail_blocks), None)
+            {
+                found_rail = Some(y);
+                break;
+            }
+        }
+
+        let rail_y = found_rail.expect("Rail block not elevated");
+        assert!(rail_y > ground_y + 1);
+
+        assert!(editor.check_for_block_absolute(
+            midpoint.x,
+            rail_y - 1,
+            midpoint.z,
+            Some(&[GRAVEL]),
+            None,
+        ));
+
+        let mut support_found = false;
+        for node in &way.nodes {
+            let node_ground = editor.get_absolute_y(node.x, 0, node.z);
+            for y in node_ground + 1..rail_y {
+                if editor.check_for_block_absolute(node.x, y, node.z, Some(&[STONE_BRICKS]), None) {
+                    support_found = true;
+                    break;
+                }
+            }
+            if support_found {
+                break;
+            }
+        }
+
+        assert!(
+            support_found,
+            "Expected stone support pillar below elevated railway"
+        );
+    }
+
+    #[test]
+    fn test_smooth_diagonal_rails() {
+        let points = vec![(0, 0, 0), (1, 0, 1), (2, 0, 2)];
+        let smoothed = smooth_diagonal_rails(&points);
+        assert!(smoothed.len() > points.len());
     }
 }

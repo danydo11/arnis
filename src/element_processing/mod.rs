@@ -3,6 +3,7 @@ pub mod barriers;
 pub mod bridges;
 pub mod buildings;
 pub mod doors;
+pub mod elevation;
 pub mod highways;
 pub mod landuse;
 pub mod leisure;
